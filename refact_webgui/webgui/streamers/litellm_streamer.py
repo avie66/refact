@@ -2,7 +2,7 @@ import json
 import litellm
 
 from refact_webgui.webgui.selfhost_webutils import log
-from refact_webgui.webgui.selfhost_fastapi_completions import ChatContext
+from refact_webgui.webgui.selfhost_sampling_params import ChatContext
 
 from typing import Dict, Any, List
 
