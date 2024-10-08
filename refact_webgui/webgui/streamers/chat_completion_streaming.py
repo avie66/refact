@@ -1,27 +1,15 @@
-import re
-import time
 import copy
 import json
 import asyncio
-import termcolor
 
 from refact_webgui.webgui.selfhost_queue import Ticket
 from refact_webgui.webgui.selfhost_webutils import log
-from refact_webgui.webgui.selfhost_sampling_params import NlpCompletion
+from refact_webgui.webgui.selfhost_sampling_params import ChatContext
+from refact_webgui.webgui.streamers.completion_streaming import red_time
 
 
-def red_time(base_ts):
-    return termcolor.colored("%0.1fms" % (1000*(time.time() - base_ts)), "red")
-
-
-def _mask_emails(text: str, mask: str = "john@example.com") -> str:
-    masked_text = text
-    for m in re.findall(r'[\w.+-]+@[\w-]+\.[\w.-]+', text):
-        masked_text = masked_text.replace(m, mask)
-    return masked_text
-
-
-async def completion_streamer(ticket: Ticket, post: NlpCompletion, timeout, seen, created_ts, caps_version: int):
+async def chat_completion_streamer(ticket: Ticket, post: ChatContext, timeout, created_ts, caps_version: int):
+    seen = [""] * post.n
     try:
         packets_cnt = 0
         while 1:
@@ -41,12 +29,7 @@ async def completion_streamer(ticket: Ticket, post: NlpCompletion, timeout, seen
                         if " " not in delta and not is_final_msg:
                             not_seen_resp["choices"][i]["text"] = ""
                             continue
-                        if post.mask_emails:
-                            if not is_final_msg:
-                                delta = " ".join(delta.split(" ")[:-1])
-                            not_seen_resp["choices"][i]["text"] = _mask_emails(delta)
-                        else:
-                            not_seen_resp["choices"][i]["text"] = delta
+                        not_seen_resp["choices"][i]["text"] = delta
                         if post.stream:
                             seen[i] = newtext[:len(seen[i])] + delta
                     else:
@@ -64,12 +47,7 @@ async def completion_streamer(ticket: Ticket, post: NlpCompletion, timeout, seen
             yield "data: [DONE]" + "\n\n"
         log(red_time(created_ts) + " /finished %s, streamed %i packets" % (ticket.id(), packets_cnt))
         ticket.done()
-        # fastapi_stats.stats_accum[kt] += msg.get("generated_tokens_n", 0)
-        # fastapi_stats.stats_accum[kcomp] += 1
-        # fastapi_stats.stats_lists_accum["stat_latency_" + post.model].append(time.time() - created_ts)
     finally:
         if ticket.id() is not None:
             log("   ***  CANCEL  ***  cancelling %s " % ticket.id() + red_time(created_ts))
-            # fastapi_stats.stats_accum["stat_api_cancelled"] += 1
-            # fastapi_stats.stats_accum["stat_m_" + post.model + "_cancelled"] += 1
         ticket.cancelled = True

@@ -1,4 +1,6 @@
 from .litellm_streamer import litellm_streamer
 from .litellm_streamer import litellm_non_streamer
 from .refact_lsp_streamer import refact_lsp_streamer
-from .completion_streaming import chat_completions_streamer
+from .completion_streaming import completion_streamer
+from .embeddings_streamer import embeddings_streamer
+from .chat_completion_streaming import chat_completion_streamer

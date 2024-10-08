@@ -1,7 +1,5 @@
 import time
 import json
-import copy
-import asyncio
 import aiohttp
 import aiofiles
 import termcolor
@@ -23,12 +21,15 @@ from refact_webgui.webgui.selfhost_queue import InferenceQueue
 from refact_webgui.webgui.selfhost_model_assigner import ModelAssigner
 from refact_webgui.webgui.selfhost_login import RefactSession
 
-from selfhost_sampling_params import NlpCompletion
-from selfhost_sampling_params import ChatContext
+from refact_webgui.webgui.selfhost_sampling_params import NlpCompletion
+from refact_webgui.webgui.selfhost_sampling_params import ChatContext
+from refact_webgui.webgui.selfhost_sampling_params import EmbeddingsStyleOpenAI
 from refact_webgui.webgui.streamers import litellm_streamer
 from refact_webgui.webgui.streamers import litellm_non_streamer
-from refact_webgui.webgui.streamers import refact_lsp_streamer
-from refact_webgui.webgui.streamers import chat_completions_streamer
+from refact_webgui.webgui.streamers import refact_lsp_streamer  # TODO: deprecated
+from refact_webgui.webgui.streamers import completion_streamer
+from refact_webgui.webgui.streamers import embeddings_streamer
+from refact_webgui.webgui.streamers import chat_completion_streamer
 
 
 from pathlib import Path
@@ -39,94 +40,6 @@ __all__ = ["BaseCompletionsRouter", "CompletionsRouter"]
 
 def red_time(base_ts):
     return termcolor.colored("%0.1fms" % (1000*(time.time() - base_ts)), "red")
-
-
-def _mask_emails(text: str, mask: str = "john@example.com") -> str:
-    masked_text = text
-    for m in re.findall(r'[\w.+-]+@[\w-]+\.[\w.-]+', text):
-        masked_text = masked_text.replace(m, mask)
-    return masked_text
-
-
-async def _completion_streamer(ticket: Ticket, post: NlpCompletion, timeout, seen, created_ts, caps_version: int):
-    try:
-        packets_cnt = 0
-        while 1:
-            try:
-                msg = await asyncio.wait_for(ticket.streaming_queue.get(), timeout)
-            except asyncio.TimeoutError:
-                log("TIMEOUT %s" % ticket.id())
-                msg = {"status": "error", "human_readable_message": "timeout"}
-            not_seen_resp = copy.deepcopy(msg)
-            not_seen_resp["caps_version"] = caps_version
-            is_final_msg = msg.get("status", "") != "in_progress"
-            if "choices" in not_seen_resp:
-                for i in range(post.n):
-                    newtext = not_seen_resp["choices"][i]["text"]
-                    if newtext.startswith(seen[i]):
-                        delta = newtext[len(seen[i]):]
-                        if " " not in delta and not is_final_msg:
-                            not_seen_resp["choices"][i]["text"] = ""
-                            continue
-                        if post.mask_emails:
-                            if not is_final_msg:
-                                delta = " ".join(delta.split(" ")[:-1])
-                            not_seen_resp["choices"][i]["text"] = _mask_emails(delta)
-                        else:
-                            not_seen_resp["choices"][i]["text"] = delta
-                        if post.stream:
-                            seen[i] = newtext[:len(seen[i])] + delta
-                    else:
-                        log("ooops seen doesn't work, might be infserver's fault")
-            if not post.stream:
-                if not is_final_msg:
-                    continue
-                yield json.dumps(not_seen_resp)
-                break
-            yield "data: " + json.dumps(not_seen_resp) + "\n\n"
-            packets_cnt += 1
-            if is_final_msg:
-                break
-        if post.stream:
-            yield "data: [DONE]" + "\n\n"
-        log(red_time(created_ts) + " /finished %s, streamed %i packets" % (ticket.id(), packets_cnt))
-        ticket.done()
-        # fastapi_stats.stats_accum[kt] += msg.get("generated_tokens_n", 0)
-        # fastapi_stats.stats_accum[kcomp] += 1
-        # fastapi_stats.stats_lists_accum["stat_latency_" + post.model].append(time.time() - created_ts)
-    finally:
-        if ticket.id() is not None:
-            log("   ***  CANCEL  ***  cancelling %s " % ticket.id() + red_time(created_ts))
-            # fastapi_stats.stats_accum["stat_api_cancelled"] += 1
-            # fastapi_stats.stats_accum["stat_m_" + post.model + "_cancelled"] += 1
-        ticket.cancelled = True
-
-
-async def embeddings_streamer(ticket: Ticket, timeout, created_ts):
-    try:
-        while 1:
-            try:
-                msg: Dict = await asyncio.wait_for(ticket.streaming_queue.get(), timeout)
-                msg['choices'] = msg['choices'][0]
-                msg["files"] = [json.loads(v) for v in msg['choices']['files'].values()]
-                del msg['choices']
-            except asyncio.TimeoutError:
-                log("TIMEOUT %s" % ticket.id())
-                msg = {"status": "error", "human_readable_message": "timeout"}
-
-            tmp = json.dumps(msg.get("files", []))
-            yield tmp
-            log("  " + red_time(created_ts) + " stream %s <- %i bytes" % (ticket.id(), len(tmp)))
-            if msg.get("status", "") != "in_progress":
-                break
-
-        log(red_time(created_ts) + " /finished call %s" % ticket.id())
-        ticket.done()
-    finally:
-        if ticket.id() is not None:
-            log("   ***  CANCEL  ***  cancelling %s" % ticket.id() + red_time(created_ts))
-        ticket.cancelled = True
-        ticket.done()
 
 
 class BaseCompletionsRouter(APIRouter):
@@ -350,7 +263,7 @@ class BaseCompletionsRouter(APIRouter):
         await q.put(ticket)
         seen = [""] * post.n
         return StreamingResponse(
-            _completion_streamer(ticket, post, self._timeout, seen, req["created"], caps_version=caps_version),
+            completion_streamer(ticket, post, self._timeout, seen, req["created"], caps_version=caps_version),
             media_type=("text/event-stream" if post.stream else "application/json"),
         )
 
@@ -478,7 +391,7 @@ class BaseCompletionsRouter(APIRouter):
             "prompt": prompt,
             "model": model_name,
             "stream": post.stream,
-            "echo": post.echo,
+            "echo": False,
             "lora_config": lora_config,
         })
         ticket.call.update(req)
@@ -486,7 +399,7 @@ class BaseCompletionsRouter(APIRouter):
         self._id2ticket[ticket.id()] = ticket
         await q.put(ticket)
 
-        return chat_completions_streamer(ticket, post, self._timeout, req["created"], caps_version=caps_version)
+        return chat_completion_streamer(ticket, post, self._timeout, req["created"], caps_version=caps_version)
 
     async def _chat_completions(self, post: ChatContext, authorization: str = Header(None)):
         account = await self._account_from_bearer(authorization)
