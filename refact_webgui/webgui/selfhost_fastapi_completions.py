@@ -23,6 +23,12 @@ from refact_webgui.webgui.selfhost_queue import InferenceQueue
 from refact_webgui.webgui.selfhost_model_assigner import ModelAssigner
 from refact_webgui.webgui.selfhost_login import RefactSession
 
+from refact_webgui.webgui.streamers import litellm_streamer
+from refact_webgui.webgui.streamers import litellm_non_streamer
+from refact_webgui.webgui.streamers import refact_lsp_streamer
+from refact_webgui.webgui.streamers import chat_completions_streamer
+
+
 from pathlib import Path
 from pydantic import BaseModel
 from typing import List, Dict, Union, Optional, Tuple, Any
@@ -490,16 +496,73 @@ class BaseCompletionsRouter(APIRouter):
             "data": data,
         }
 
-    async def _chat_completions(self, post: ChatContext, authorization: str = Header(None)):
-        def compose_usage_dict(model_dict, prompt_tokens_n, generated_tokens_n) -> Dict[str, Any]:
-            usage_dict = dict()
-            usage_dict["pp1000t_prompt"] = model_dict.get("pp1000t_prompt", 0)
-            usage_dict["pp1000t_generated"] = model_dict.get("pp1000t_generated", 0)
-            usage_dict["metering_prompt_tokens_n"] = prompt_tokens_n
-            usage_dict["metering_generated_tokens_n"] = generated_tokens_n
-            return usage_dict
+    async def _chat_completions_streamer(
+            self,
+            messages: List,
+            post: ChatContext,
+            account: str,
+            model_dict: Dict,
+            model_name: str,
+            lora_config: Dict,
+            caps_version: int,
+    ):
+        ticket = Ticket("chat-comp-")
+        req = post.clamp()
 
-        _account = await self._account_from_bearer(authorization)
+        if "chat" not in model_dict.get("filter_caps", []):
+            err_message = f'chat completion from "{account}" failed: "{post.model}" does not support chat'
+            log(err_message)
+            raise HTTPException(status_code=401, detail=err_message)
+
+        if "model_path" not in model_dict:
+            err_message = f'chat completion from "{account}" failed: "{post.model}" has no model_path'
+            log(err_message)
+            raise HTTPException(status_code=401, detail=err_message)
+
+        from transformers import AutoTokenizer
+
+        # preload map tokenizers
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_dict["model_path"], cache_dir=env.DIR_WEIGHTS,
+            local_files_only=True, trust_remote_code=True,
+        )
+        # NOTE: idk how to use tool_choice with transformers models
+        prompt = tokenizer.apply_chat_template(messages, tools=post.tools, tokenize=False)
+
+        req.update({
+            "object": "text_completion_req",
+            "account": account,
+            "prompt": prompt,
+            "model": model_name,
+            "stream": post.stream,
+            "echo": post.echo,
+            "lora_config": lora_config,
+        })
+        ticket.call.update(req)
+        q = self._inference_queue.model_name_to_queue(ticket, model_name)
+        self._id2ticket[ticket.id()] = ticket
+        await q.put(ticket)
+
+        return chat_completions_streamer(ticket, post, self._timeout, req["created"], caps_version=caps_version)
+
+    async def _chat_completions(self, post: ChatContext, authorization: str = Header(None)):
+        account = await self._account_from_bearer(authorization)
+
+        caps_version = self._caps_version
+        model_name, lora_config = await self._resolve_model_lora(post.model)
+        model_name, err_msg = static_resolve_model(model_name, self._inference_queue)
+
+        if err_msg:
+            log(f'chat completions model resolve "{post.model}" -> error "{err_msg}" from {account}')
+            return Response(status_code=400,
+                            content=json.dumps({"detail": err_msg, "caps_version": caps_version}, indent=4),
+                            media_type="application/json")
+
+        if lora_config:
+            log(f'chat completions model resolve "{post.model}" -> "{model_name}" lora {lora_config} from {account}')
+        else:
+            log(f'chat completions model resolve "{post.model}" -> "{model_name}" from {account}')
+
         messages = []
         for m in (i.dict() for i in post.messages):
             # drop tool_calls if empty, otherwise litellm tokenizing won't work
@@ -507,117 +570,187 @@ class BaseCompletionsRouter(APIRouter):
                 del m["tool_calls"]
             messages.append(m)
 
-        prefix, postfix = "data: ", "\n\n"
-        model_dict = self._model_assigner.models_db_with_passthrough.get(post.model, {})
+        model_dict = self._model_assigner.models_db_with_passthrough.get(model_name, {})
 
-        async def litellm_streamer():
-            generated_tokens_n = 0
-            try:
-                self._integrations_env_setup()
-                response = await litellm.acompletion(
-                    model=model_name, messages=messages, stream=True,
-                    temperature=post.temperature, top_p=post.top_p,
-                    max_tokens=min(model_dict.get('T_out', post.max_tokens), post.max_tokens),
-                    tools=post.tools,
-                    tool_choice=post.tool_choice,
-                    stop=post.stop,
-                    n=post.n,
-                )
-                finish_reason = None
-                async for model_response in response:
-                    try:
-                        data = model_response.dict()
-                        choice0 = data["choices"][0]
-                        finish_reason = choice0["finish_reason"]
-                        if delta := choice0.get("delta"):
-                            if text := delta.get("content"):
-                                generated_tokens_n += litellm.token_counter(model_name, text=text)
-
-                    except json.JSONDecodeError:
-                        data = {"choices": [{"finish_reason": finish_reason}]}
-                    yield prefix + json.dumps(data) + postfix
-
-                final_msg = {"choices": []}
-                usage_dict = compose_usage_dict(model_dict, prompt_tokens_n, generated_tokens_n)
-                final_msg.update(usage_dict)
-                yield prefix + json.dumps(final_msg) + postfix
-
-                # NOTE: DONE needed by refact-lsp server
-                yield prefix + "[DONE]" + postfix
-            except BaseException as e:
-                err_msg = f"litellm error (1): {e}"
-                log(err_msg)
-                yield prefix + json.dumps({"error": err_msg}) + postfix
-
-        async def litellm_non_streamer():
-            generated_tokens_n = 0
-            try:
-                self._integrations_env_setup()
-                model_response = await litellm.acompletion(
-                    model=model_name, messages=messages, stream=False,
-                    temperature=post.temperature, top_p=post.top_p,
-                    max_tokens=min(model_dict.get('T_out', post.max_tokens), post.max_tokens),
-                    tools=post.tools,
-                    tool_choice=post.tool_choice,
-                    stop=post.stop,
-                    n=post.n,
-                )
-                finish_reason = None
-                try:
-                    data = model_response.dict()
-                    for choice in data.get("choices", []):
-                        if text := choice.get("message", {}).get("content"):
-                            generated_tokens_n += litellm.token_counter(model_name, text=text)
-                        finish_reason = choice.get("finish_reason")
-                    usage_dict = compose_usage_dict(model_dict, prompt_tokens_n, generated_tokens_n)
-                    data.update(usage_dict)
-                except json.JSONDecodeError:
-                    data = {"choices": [{"finish_reason": finish_reason}]}
-                yield json.dumps(data)
-            except BaseException as e:
-                err_msg = f"litellm error (2): {e}"
-                log(err_msg)
-                yield json.dumps({"error": err_msg})
-
-        async def chat_completion_streamer():
-            post_url = "http://127.0.0.1:8001/v1/chat"
-            payload = {
-                "messages": messages,
-                "stream": True,
-                "model": post.model,
-                "parameters": {
-                    "temperature": post.temperature,
-                    "max_new_tokens": post.max_tokens,
-                }
-            }
-            async with aiohttp.ClientSession() as session:
-                try:
-                    async with session.post(post_url, json=payload) as response:
-                        finish_reason = None
-                        async for data, _ in response.content.iter_chunks():
-                            try:
-                                data = data.decode("utf-8")
-                                data = json.loads(data[len(prefix):-len(postfix)])
-                                finish_reason = data["choices"][0]["finish_reason"]
-                                data["choices"][0]["finish_reason"] = None
-                            except json.JSONDecodeError:
-                                data = {"choices": [{"finish_reason": finish_reason}]}
-                            yield prefix + json.dumps(data) + postfix
-                except aiohttp.ClientConnectorError as e:
-                    err_msg = f"LSP server is not ready yet: {e}"
-                    log(err_msg)
-                    yield prefix + json.dumps({"error": err_msg}) + postfix
-
-        if model_dict.get('backend') == 'litellm' and (model_name := model_dict.get('resolve_as', post.model)) in litellm.model_list:
-            log(f"chat/completions: model resolve {post.model} -> {model_name}")
-            prompt_tokens_n = litellm.token_counter(model_name, messages=messages)
-            if post.tools:
-                prompt_tokens_n += litellm.token_counter(model_name, text=json.dumps(post.tools))
-            response_streamer = litellm_streamer() if post.stream else litellm_non_streamer()
+        if model_dict.get('backend') == 'litellm':
+            log(f"chat/completions: model resolve {post.model} -> {model_dict['resolve_as']}")
+            response_streamer = litellm_streamer(model_dict, messages, post) if post.stream else litellm_non_streamer(model_dict, messages, post)
         else:
-            response_streamer = chat_completion_streamer()
+            # NOTE: always stream=True
+            # response_streamer = refact_lsp_streamer(messages, post)
+            response_streamer = await self._chat_completions_streamer(
+                messages, post, account, model_dict, model_name, lora_config, caps_version)
+            # return await completions_streaming()
 
         return StreamingResponse(response_streamer, media_type="text/event-stream")
+
+    # async def _chat_completions(self, post: ChatContext, authorization: str = Header(None)):
+    #     def compose_usage_dict(model_dict, prompt_tokens_n, generated_tokens_n) -> Dict[str, Any]:
+    #         usage_dict = dict()
+    #         usage_dict["pp1000t_prompt"] = model_dict.get("pp1000t_prompt", 0)
+    #         usage_dict["pp1000t_generated"] = model_dict.get("pp1000t_generated", 0)
+    #         usage_dict["metering_prompt_tokens_n"] = prompt_tokens_n
+    #         usage_dict["metering_generated_tokens_n"] = generated_tokens_n
+    #         return usage_dict
+    #
+    #     _account = await self._account_from_bearer(authorization)
+    #     messages = []
+    #     for m in (i.dict() for i in post.messages):
+    #         # drop tool_calls if empty, otherwise litellm tokenizing won't work
+    #         if "tool_calls" in m and not m["tool_calls"]:
+    #             del m["tool_calls"]
+    #         messages.append(m)
+    #
+    #     prefix, postfix = "data: ", "\n\n"
+    #     model_dict = self._model_assigner.models_db_with_passthrough.get(post.model, {})
+    #
+    #     async def litellm_streamer():
+    #         generated_tokens_n = 0
+    #         try:
+    #             self._integrations_env_setup()
+    #             response = await litellm.acompletion(
+    #                 model=model_name, messages=messages, stream=True,
+    #                 temperature=post.temperature, top_p=post.top_p,
+    #                 max_tokens=min(model_dict.get('T_out', post.max_tokens), post.max_tokens),
+    #                 tools=post.tools,
+    #                 tool_choice=post.tool_choice,
+    #                 stop=post.stop,
+    #                 n=post.n,
+    #             )
+    #             finish_reason = None
+    #             async for model_response in response:
+    #                 try:
+    #                     data = model_response.dict()
+    #                     choice0 = data["choices"][0]
+    #                     finish_reason = choice0["finish_reason"]
+    #                     if delta := choice0.get("delta"):
+    #                         if text := delta.get("content"):
+    #                             generated_tokens_n += litellm.token_counter(model_name, text=text)
+    #
+    #                 except json.JSONDecodeError:
+    #                     data = {"choices": [{"finish_reason": finish_reason}]}
+    #                 yield prefix + json.dumps(data) + postfix
+    #
+    #             final_msg = {"choices": []}
+    #             usage_dict = compose_usage_dict(model_dict, prompt_tokens_n, generated_tokens_n)
+    #             final_msg.update(usage_dict)
+    #             yield prefix + json.dumps(final_msg) + postfix
+    #
+    #             # NOTE: DONE needed by refact-lsp server
+    #             yield prefix + "[DONE]" + postfix
+    #         except BaseException as e:
+    #             err_msg = f"litellm error (1): {e}"
+    #             log(err_msg)
+    #             yield prefix + json.dumps({"error": err_msg}) + postfix
+    #
+    #     async def litellm_non_streamer():
+    #         generated_tokens_n = 0
+    #         try:
+    #             self._integrations_env_setup()
+    #             model_response = await litellm.acompletion(
+    #                 model=model_name, messages=messages, stream=False,
+    #                 temperature=post.temperature, top_p=post.top_p,
+    #                 max_tokens=min(model_dict.get('T_out', post.max_tokens), post.max_tokens),
+    #                 tools=post.tools,
+    #                 tool_choice=post.tool_choice,
+    #                 stop=post.stop,
+    #                 n=post.n,
+    #             )
+    #             finish_reason = None
+    #             try:
+    #                 data = model_response.dict()
+    #                 for choice in data.get("choices", []):
+    #                     if text := choice.get("message", {}).get("content"):
+    #                         generated_tokens_n += litellm.token_counter(model_name, text=text)
+    #                     finish_reason = choice.get("finish_reason")
+    #                 usage_dict = compose_usage_dict(model_dict, prompt_tokens_n, generated_tokens_n)
+    #                 data.update(usage_dict)
+    #             except json.JSONDecodeError:
+    #                 data = {"choices": [{"finish_reason": finish_reason}]}
+    #             yield json.dumps(data)
+    #         except BaseException as e:
+    #             err_msg = f"litellm error (2): {e}"
+    #             log(err_msg)
+    #             yield json.dumps({"error": err_msg})
+    #
+    #     async def chat_completion_streamer():
+    #         post_url = "http://127.0.0.1:8001/v1/chat"
+    #         payload = {
+    #             "messages": messages,
+    #             "stream": True,
+    #             "model": post.model,
+    #             "parameters": {
+    #                 "temperature": post.temperature,
+    #                 "max_new_tokens": post.max_tokens,
+    #             }
+    #         }
+    #         async with aiohttp.ClientSession() as session:
+    #             try:
+    #                 async with session.post(post_url, json=payload) as response:
+    #                     finish_reason = None
+    #                     async for data, _ in response.content.iter_chunks():
+    #                         try:
+    #                             data = data.decode("utf-8")
+    #                             data = json.loads(data[len(prefix):-len(postfix)])
+    #                             finish_reason = data["choices"][0]["finish_reason"]
+    #                             data["choices"][0]["finish_reason"] = None
+    #                         except json.JSONDecodeError:
+    #                             data = {"choices": [{"finish_reason": finish_reason}]}
+    #                         yield prefix + json.dumps(data) + postfix
+    #             except aiohttp.ClientConnectorError as e:
+    #                 err_msg = f"LSP server is not ready yet: {e}"
+    #                 log(err_msg)
+    #                 yield prefix + json.dumps({"error": err_msg}) + postfix
+    #
+    #     async def completions_streaming():
+    #         from transformers import AutoTokenizer
+    #
+    #         if "chat" not in model_dict.get("filter_caps", []):
+    #             err_message = f'chat completion from "{_account}" failed: "{post.model}" does not support chat'
+    #             log(err_message)
+    #             raise HTTPException(status_code=401, detail=err_message)
+    #
+    #         if "model_path" not in model_dict:
+    #             err_message = f'chat completion from "{_account}" failed: "{post.model}" has no model_path'
+    #             log(err_message)
+    #             raise HTTPException(status_code=401, detail=err_message)
+    #
+    #         # preload map tokenizers
+    #         tokenizer = AutoTokenizer.from_pretrained(
+    #             model_dict["model_path"], cache_dir=env.DIR_WEIGHTS,
+    #             local_files_only=True, trust_remote_code=True,
+    #         )
+    #         # NOTE: idk how to use tool_choice with transformers models
+    #         prompt = tokenizer.apply_chat_template(messages, tools=post.tools, tokenize=False)
+    #         completions_post = NlpCompletion(
+    #             max_tokens=post.max_tokens,
+    #             temperature=post.temperature,
+    #             top_p=post.top_p,
+    #             top_n=post.top_n,
+    #             stop=post.stop,
+    #
+    #             model=post.model,
+    #             prompt=prompt,
+    #             n=post.n,
+    #             stream=post.stream,
+    #
+    #             echo=False,
+    #             mask_emails=False,
+    #         )
+    #
+    #         return await self._completions(completions_post, authorization)
+    #
+    #     if model_dict.get('backend') == 'litellm' and (model_name := model_dict.get('resolve_as', post.model)) in litellm.model_list:
+    #         log(f"chat/completions: model resolve {post.model} -> {model_name}")
+    #         prompt_tokens_n = litellm.token_counter(model_name, messages=messages)
+    #         if post.tools:
+    #             prompt_tokens_n += litellm.token_counter(model_name, text=json.dumps(post.tools))
+    #         response_streamer = litellm_streamer() if post.stream else litellm_non_streamer()
+    #     else:
+    #         # response_streamer = chat_completion_streamer()
+    #         return await completions_streaming()
+    #
+    #     return StreamingResponse(response_streamer, media_type="text/event-stream")
 
 
 class CompletionsRouter(BaseCompletionsRouter):

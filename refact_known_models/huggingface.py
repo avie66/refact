@@ -125,4 +125,14 @@ huggingface_mini_db = {
         "T": 16384,  # in fact this model can handle 128K context
         "filter_caps": ["completion", "chat"],
     },
+    "llama3.2/3b/instruct": {
+        "backend": "transformers",
+        "model_path": "meta-llama/Llama-3.2-3B-Instruct",
+        "model_class_kwargs": {
+            "torch_dtype": "bf16",
+        },
+        "required_memory_mb": 8000,
+        "T": 16384,  # TODO: this model can handle 128K context
+        "filter_caps": ["chat"],
+    },
 }
